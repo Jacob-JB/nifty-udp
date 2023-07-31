@@ -10,17 +10,23 @@ fn main() {
 
             heartbeat_interval: 100,
             timeout: 10000,
+            ping_memory_length: 16,
 
             listen: false,
 
             channels: vec![
                 ChannelConfig::SendUnreliable,
                 ChannelConfig::ReceiveUnreliable,
+
+                ChannelConfig::SendReliable {
+                    resend_threshhold: 1.25
+                },
+                ChannelConfig::ReceiveReliable,
             ],
         }
     ).unwrap();
 
-    client.connect("10.176.80.83:3000".parse().unwrap()).unwrap();
+    client.connect("10.0.20.207:3000".parse().unwrap()).unwrap();
 
     let mut last_ping = Instant::now();
 
@@ -33,8 +39,8 @@ fn main() {
             }
         }
 
-        if last_ping.elapsed().as_millis() > 2000 {
-            client.send_single(0, "Ping".as_bytes()).unwrap();
+        if last_ping.elapsed().as_millis() > 3000 {
+            client.send_single(2, "Ping".as_bytes()).unwrap();
             last_ping = Instant::now();
         }
     }

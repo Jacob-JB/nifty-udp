@@ -7,12 +7,18 @@ fn main() {
 
             heartbeat_interval: 100,
             timeout: 10000,
+            ping_memory_length: 16,
 
             listen: true,
 
             channels: vec![
                 ChannelConfig::ReceiveUnreliable,
                 ChannelConfig::SendUnreliable,
+
+                ChannelConfig::ReceiveReliable,
+                ChannelConfig::SendReliable {
+                    resend_threshhold: 1.25
+                },
             ],
         },
         "0.0.0.0:3000".parse().unwrap()

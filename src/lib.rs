@@ -1,5 +1,5 @@
-use std::{net::{UdpSocket, SocketAddr}, time::Instant, collections::{HashMap, hash_map::Entry}};
-
+use std::{net::{UdpSocket, SocketAddr}, time::{Instant, UNIX_EPOCH, SystemTime}, collections::{HashMap, hash_map::Entry, VecDeque}};
+use rand::{thread_rng, rngs::ThreadRng, Rng};
 
 
 /// describes the static behavior of a client
@@ -13,6 +13,9 @@ pub struct ClientConfig {
     pub heartbeat_interval: u128,
     /// timeout length for when to close a connection for not responding
     pub timeout: u128,
+
+    /// how many ping time samples to keep
+    pub ping_memory_length: u8,
 
     /// set to true to accept incoming connections
     ///
@@ -30,7 +33,15 @@ pub struct ClientConfig {
 pub enum ChannelConfig {
     SendUnreliable,
     ReceiveUnreliable,
+    SendReliable {
+        /// at what multiple after the connections average ping time should a message be resent
+        resend_threshhold: f32,
+    },
+    ReceiveReliable,
 }
+
+
+const CHANNEL_OFFSET: u8 = 3;
 
 
 pub(crate) struct Socket {
@@ -40,6 +51,8 @@ pub(crate) struct Socket {
     out_buffer: Vec<u8>,
 
     max_message_size: usize,
+
+    rng: ThreadRng,
 }
 
 impl Socket {
@@ -56,6 +69,8 @@ impl Socket {
             out_buffer: Vec::with_capacity(max_message_size),
 
             max_message_size,
+
+            rng: thread_rng(),
         })
     }
 
@@ -75,6 +90,8 @@ impl Socket {
     }
 
     fn send(&mut self, addr: SocketAddr) -> Result<usize, Error> {
+        if self.rng.gen_bool(0.2) {return Ok(0);}
+
         Ok(self.socket.send_to(&self.out_buffer, addr)?)
     }
 
@@ -82,9 +99,11 @@ impl Socket {
         self.socket.recv_from(&mut self.in_buffer).ok().and_then(|(received_bytes, origin)| Some((&self.in_buffer[..received_bytes], origin)))
     }
 
-    fn heartbeat(&mut self, addr: SocketAddr) -> Result<(), Error> {
+    fn heartbeat(&mut self, addr: SocketAddr, instance: &[u8; 16], time: u128) -> Result<(), Error> {
         self.clear_buffer();
         self.write(&[0])?;
+        self.write(instance)?;
+        self.write(&time.to_be_bytes())?;
         self.send(addr)?;
         Ok(())
     }
@@ -98,7 +117,7 @@ impl Socket {
 
     fn channel_prefix(&mut self, channel_id: u8) -> Result<(), Error> {
         self.clear_buffer();
-        self.write(&[channel_id + 2])?;
+        self.write(&[channel_id + CHANNEL_OFFSET])?;
         Ok(())
     }
 }
@@ -106,6 +125,8 @@ impl Socket {
 
 pub struct Client {
     socket: Socket,
+
+    instance: [u8; 16],
 
     connections: HashMap<SocketAddr, Connection>,
 
@@ -116,7 +137,7 @@ pub struct Client {
 
 impl Client {
     pub fn bind(config: ClientConfig, bind_addr: SocketAddr) -> Result<Self, Error> {
-        if config.channels.len() > (u8::MAX - 2) as usize {
+        if config.channels.len() > (u8::MAX - CHANNEL_OFFSET) as usize {
             return Err(Error::TooManyChannels);
         }
 
@@ -124,6 +145,8 @@ impl Client {
 
         Ok(Client {
             socket,
+
+            instance: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis().to_be_bytes(),
 
             connections: HashMap::new(),
 
@@ -138,7 +161,7 @@ impl Client {
     }
 
     pub fn connect(&mut self, addr: SocketAddr) -> Result<(), Error> {
-        self.connections.insert(addr, Connection::new(&self.config, addr, &mut self.socket)?);
+        self.connections.insert(addr, Connection::new(&self.config, addr, &self.instance, &mut self.socket)?);
 
         self.events.push(Event::Connection(addr));
 
@@ -162,10 +185,20 @@ impl Client {
         while let Some((message, origin)) = self.socket.receive() {
 
             let mut channel_message = None;
+            let mut heartbeat_data: Option<([u8; 16], [u8; 16])> = None;
+            let mut time_response = None;
 
             let valid_message = match message.get(0) {
                 None => false,
-                Some(0) => true,
+                Some(0) => {
+
+                    if let (Some(instance_bytes), Some(time_bytes)) = (message.get(1..17), message.get(17..33)) {
+                        heartbeat_data = Some((instance_bytes.try_into().unwrap(), time_bytes.try_into().unwrap()));
+                        true
+                    } else {
+                        false
+                    }
+                },
                 Some(1) => {
                     if self.connections.remove(&origin).is_some() {
                         self.events.push(Event::Disconnection(origin, DisconnectReason::Other));
@@ -173,8 +206,17 @@ impl Client {
 
                     false
                 },
+                Some(2) => {
+
+                    if let Some(bytes) = message.get(1..17) {
+                        time_response = Some(u128::from_be_bytes(bytes.try_into().unwrap()));
+                        true
+                    } else {
+                        false
+                    }
+                },
                 Some(channel_id) => {
-                    let channel_id = *channel_id - 2;
+                    let channel_id = *channel_id - CHANNEL_OFFSET;
                     if ((channel_id) as usize) < self.config.channels.len() {
                         channel_message = Some((channel_id, Vec::from(&message[1..])));
                         true
@@ -189,7 +231,7 @@ impl Client {
                     Entry::Occupied(entry) => entry.into_mut(),
                     Entry::Vacant(entry) => {
                         if self.config.listen {
-                            let connection = entry.insert(Connection::new(&self.config, origin, &mut self.socket)?);
+                            let connection = entry.insert(Connection::new(&self.config, origin, &self.instance, &mut self.socket)?);
                             self.events.push(Event::Connection(origin));
                             connection
                         } else {
@@ -207,6 +249,34 @@ impl Client {
                             self.events.push(Event::Message(origin, channel_id, message));
                         }
                     }
+                }
+
+                if let Some(time) = time_response {
+                    let diff = connection.creation_time.elapsed().as_millis() - time;
+
+                    if connection.ping_memory.len() >= self.config.ping_memory_length as usize {
+                        connection.ping_memory.pop_front();
+                    }
+                    connection.ping_memory.push_back(diff);
+
+                    connection.average_ping = connection.ping_memory.iter().fold(0, |p, &e| p + e) / connection.ping_memory.len() as u128;
+
+                    println!("current ping is {}", connection.average_ping);
+                }
+
+                if let Some((instance, time)) = heartbeat_data {
+                    match connection.other_instance {
+                        None => connection.other_instance = Some(instance),
+                        Some(other_instance) => if instance != other_instance {
+                            self.connections.remove(&origin);
+                            self.events.push(Event::Disconnection(origin, DisconnectReason::OriginChangedInstance));
+                        }
+                    }
+
+                    self.socket.clear_buffer();
+                    self.socket.write(&[2])?;
+                    self.socket.write(&time)?;
+                    self.socket.send(origin)?;
                 }
             }
         }
@@ -229,7 +299,7 @@ impl Client {
 
         // update clients
         for connection in self.connections.values_mut() {
-            connection.update(&mut self.socket)?;
+            connection.update(&self.instance, &mut self.socket)?;
         }
 
 
@@ -260,6 +330,12 @@ impl Client {
 pub struct Connection {
     addr: SocketAddr,
 
+    other_instance: Option<[u8; 16]>,
+
+    creation_time: Instant,
+    ping_memory: VecDeque<u128>,
+    average_ping: u128,
+
     heartbeat_interval: u128,
 
     last_received_keep_alive: Instant,
@@ -269,11 +345,19 @@ pub struct Connection {
 }
 
 impl Connection {
-    fn new(config: &ClientConfig, addr: SocketAddr, socket: &mut Socket) -> Result<Self, Error> {
-        socket.heartbeat(addr)?;
+    fn new(config: &ClientConfig, addr: SocketAddr, instance: &[u8; 16], socket: &mut Socket) -> Result<Self, Error> {
+        let creation_time = Instant::now();
+
+        socket.heartbeat(addr, instance, creation_time.elapsed().as_millis())?;
 
         Ok(Connection {
             addr,
+
+            other_instance: None,
+
+            creation_time,
+            ping_memory: VecDeque::new(),
+            average_ping: 1000,
 
             heartbeat_interval: config.heartbeat_interval,
 
@@ -284,10 +368,14 @@ impl Connection {
         })
     }
 
-    fn update(&mut self, socket: &mut Socket) -> Result<(), Error> {
+    fn update(&mut self, instance: &[u8; 16], socket: &mut Socket) -> Result<(), Error> {
         if self.last_sent_keep_alive.elapsed().as_millis() > self.heartbeat_interval {
-            socket.heartbeat(self.addr)?;
+            socket.heartbeat(self.addr, instance, self.creation_time.elapsed().as_millis())?;
             self.last_sent_keep_alive = Instant::now();
+        }
+
+        for channel in self.channels.iter_mut() {
+            channel.update(self.average_ping, socket)?;
         }
 
         Ok(())
@@ -306,6 +394,7 @@ pub enum DisconnectReason {
     Kicked,
     Other,
     Timeout,
+    OriginChangedInstance,
 }
 
 
@@ -319,6 +408,21 @@ struct Channel {
 enum ChannelType {
     SendUnreliable,
     ReceiveUnreliable,
+
+    SendReliable {
+        resend_threshhold: f32,
+
+        seq_counter: u64,
+
+        messages_start_seq: u64,
+        messages: VecDeque<Option<(Instant, Vec<u8>)>>
+    },
+    ReceiveReliable {
+        acks_to_send: Vec<u64>,
+
+        received_start_seq: u64,
+        received: VecDeque<bool>,
+    }
 }
 
 impl Channel {
@@ -330,6 +434,20 @@ impl Channel {
             channel_type: match config {
                 ChannelConfig::SendUnreliable => ChannelType::SendUnreliable,
                 ChannelConfig::ReceiveUnreliable => ChannelType::ReceiveUnreliable,
+                ChannelConfig::SendReliable { resend_threshhold } => ChannelType::SendReliable {
+                    resend_threshhold: *resend_threshhold,
+
+                    seq_counter: 0,
+
+                    messages_start_seq: 0,
+                    messages: VecDeque::new(),
+                },
+                ChannelConfig::ReceiveReliable => ChannelType::ReceiveReliable {
+                    acks_to_send: Vec::new(),
+
+                    received_start_seq: 0,
+                    received: VecDeque::new(),
+                }
             }
         }
     }
@@ -337,13 +455,28 @@ impl Channel {
     fn send(&mut self, message: &[u8], socket: &mut Socket) -> Result<(), Error> {
         socket.channel_prefix(self.channel_id)?;
 
-        match self.channel_type {
+        match &mut self.channel_type {
             ChannelType::ReceiveUnreliable => return Err(Error::SendOnReceiveChannel),
+            ChannelType::ReceiveReliable { .. } => return Err(Error::SendOnReceiveChannel),
+
 
             ChannelType::SendUnreliable => {
                 socket.write(message)?;
                 socket.send(self.addr)?;
-            }
+            },
+
+
+            ChannelType::SendReliable { seq_counter, messages, .. } => {
+                socket.write(&seq_counter.to_be_bytes())?;
+                socket.write(message)?;
+                socket.send(self.addr)?;
+
+                println!("sent seq {}", seq_counter);
+
+                messages.push_back(Some((Instant::now(), Vec::from(message))));
+                *seq_counter += 1;
+
+            },
         }
 
         Ok(())
@@ -352,11 +485,114 @@ impl Channel {
     fn receive(&mut self, message: Vec<u8>, socket: &mut Socket) -> Result<Vec<Vec<u8>>, Error> {
         let _ = socket;
 
-        Ok(match self.channel_type {
+        Ok(match &mut self.channel_type {
             ChannelType::SendUnreliable => vec![],
 
             ChannelType::ReceiveUnreliable => vec![message],
+
+            ChannelType::SendReliable { messages_start_seq, messages, .. } => 'b: {
+
+                let Some(bytes) = message.get(..8) else {break 'b vec![];};
+                let seq = u64::from_be_bytes(bytes.try_into().unwrap());
+
+                if seq < *messages_start_seq {break 'b vec![];}
+
+                // will fail if seq hasn't been sent
+                let Some(entry) = messages.get_mut((seq - *messages_start_seq) as usize) else {break 'b vec![];};
+
+                println!("got ack {}", seq);
+                if entry.is_some() {
+                    println!("marked");
+                }
+
+                // mark entry as received
+                *entry = None;
+
+                while let Some(None) = messages.front() {
+                    messages.pop_front();
+                    *messages_start_seq += 1;
+                }
+
+                vec![]
+            },
+
+            ChannelType::ReceiveReliable { acks_to_send, received_start_seq, received } => 'b: {
+                // only return messages with sequence numbers that haven't been seen
+
+                let Some(bytes) = message.get(..8) else {break 'b vec![];};
+                let seq = u64::from_be_bytes(bytes.try_into().unwrap());
+
+                println!("got seq {}", seq);
+
+                acks_to_send.push(seq);
+
+                if seq < *received_start_seq {break 'b vec![];}
+
+                let i = (seq - *received_start_seq) as usize;
+                let seen = loop {
+                    match received.get_mut(i) {
+                        None => received.push_back(false),
+                        Some(e) => break e,
+                    }
+                };
+
+                if *seen {
+                    println!("seen");
+                    break 'b vec![];
+                }
+
+                println!("returned");
+                *seen = true;
+
+                while let Some(false) = received.front() {
+                    received.pop_front();
+                    *received_start_seq += 1;
+                }
+
+                vec![Vec::from(&message[8..])]
+            }
         })
+    }
+
+    fn update(&mut self, ping: u128, socket: &mut Socket) -> Result<(), Error> {
+        match &mut self.channel_type {
+            ChannelType::SendUnreliable => (),
+            ChannelType::ReceiveUnreliable => (),
+
+            ChannelType::SendReliable { messages, messages_start_seq, resend_threshhold, .. } => {
+                let mut seq = *messages_start_seq;
+                for message in messages.iter_mut() {
+                    if let Some((last_sent, message)) = message {
+
+
+                        if last_sent.elapsed().as_millis() as f32 > ping as f32 * *resend_threshhold {
+                            socket.channel_prefix(self.channel_id)?;
+                            socket.write(&seq.to_be_bytes())?;
+                            socket.write(&*message)?;
+                            socket.send(self.addr)?;
+
+                            *last_sent = Instant::now();
+
+                            println!("resent seq {}", seq);
+                        }
+                    }
+
+                    seq += 1;
+                }
+            },
+
+            ChannelType::ReceiveReliable { acks_to_send, .. } => {
+                for seq in acks_to_send.drain(..) {
+                    socket.channel_prefix(self.channel_id)?;
+                    socket.write(&seq.to_be_bytes())?;
+                    socket.send(self.addr)?;
+
+                    println!("sent ack {}", seq);
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
