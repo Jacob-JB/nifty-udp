@@ -1,5 +1,4 @@
 use std::{net::{UdpSocket, SocketAddr}, time::{Instant, UNIX_EPOCH, SystemTime}, collections::{HashMap, hash_map::Entry, VecDeque}};
-use rand::{thread_rng, rngs::ThreadRng, Rng};
 
 
 /// describes the static behavior of a client
@@ -51,8 +50,6 @@ pub(crate) struct Socket {
     out_buffer: Vec<u8>,
 
     max_message_size: usize,
-
-    rng: ThreadRng,
 }
 
 impl Socket {
@@ -69,8 +66,6 @@ impl Socket {
             out_buffer: Vec::with_capacity(max_message_size),
 
             max_message_size,
-
-            rng: thread_rng(),
         })
     }
 
@@ -90,8 +85,6 @@ impl Socket {
     }
 
     fn send(&mut self, addr: SocketAddr) -> Result<usize, Error> {
-        if self.rng.gen_bool(0.2) {return Ok(0);}
-
         Ok(self.socket.send_to(&self.out_buffer, addr)?)
     }
 
@@ -339,6 +332,10 @@ impl Client {
 
     pub fn connections(&self) -> impl Iterator<Item = SocketAddr> + '_ {
         self.connections.keys().cloned()
+    }
+
+    pub fn bound_addr(&self) -> Result<SocketAddr, Error> {
+        Ok(self.socket.socket.local_addr()?)
     }
 }
 
