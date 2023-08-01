@@ -179,6 +179,15 @@ impl Client {
         })
     }
 
+    pub fn disconnect_all(&mut self) -> Result<(), Error> {
+        for (addr, _) in std::mem::replace(&mut self.connections, HashMap::new()) {
+            self.socket.close(addr)?;
+            self.events.push(Event::Disconnection(addr, DisconnectReason::Kicked));
+        }
+
+        Ok(())
+    }
+
     pub fn update(&mut self) -> Result<Vec<Event>, Error> {
 
         // receive messages
@@ -259,9 +268,7 @@ impl Client {
                     }
                     connection.ping_memory.push_back(diff);
 
-                    connection.average_ping = connection.ping_memory.iter().fold(0, |p, &e| p + e) / connection.ping_memory.len() as u128;
-
-                    println!("current ping is {}", connection.average_ping);
+                    connection.average_ping = Some(connection.ping_memory.iter().fold(0, |p, &e| p + e) / connection.ping_memory.len() as u128);
                 }
 
                 if let Some((instance, time)) = heartbeat_data {
@@ -325,6 +332,14 @@ impl Client {
             _ => unreachable!(),
         }
     }
+
+    pub fn get_ping(&self, connection: SocketAddr) -> Result<Option<u128>, Error> {
+        self.connections.get(&connection).ok_or(Error::AddressNotConnected).and_then(|connection| Ok(connection.average_ping))
+    }
+
+    pub fn connections(&self) -> impl Iterator<Item = SocketAddr> + '_ {
+        self.connections.keys().cloned()
+    }
 }
 
 pub struct Connection {
@@ -334,7 +349,7 @@ pub struct Connection {
 
     creation_time: Instant,
     ping_memory: VecDeque<u128>,
-    average_ping: u128,
+    average_ping: Option<u128>,
 
     heartbeat_interval: u128,
 
@@ -357,7 +372,7 @@ impl Connection {
 
             creation_time,
             ping_memory: VecDeque::new(),
-            average_ping: 1000,
+            average_ping: None,
 
             heartbeat_interval: config.heartbeat_interval,
 
@@ -471,8 +486,6 @@ impl Channel {
                 socket.write(message)?;
                 socket.send(self.addr)?;
 
-                println!("sent seq {}", seq_counter);
-
                 messages.push_back(Some((Instant::now(), Vec::from(message))));
                 *seq_counter += 1;
 
@@ -500,11 +513,6 @@ impl Channel {
                 // will fail if seq hasn't been sent
                 let Some(entry) = messages.get_mut((seq - *messages_start_seq) as usize) else {break 'b vec![];};
 
-                println!("got ack {}", seq);
-                if entry.is_some() {
-                    println!("marked");
-                }
-
                 // mark entry as received
                 *entry = None;
 
@@ -522,8 +530,6 @@ impl Channel {
                 let Some(bytes) = message.get(..8) else {break 'b vec![];};
                 let seq = u64::from_be_bytes(bytes.try_into().unwrap());
 
-                println!("got seq {}", seq);
-
                 acks_to_send.push(seq);
 
                 if seq < *received_start_seq {break 'b vec![];}
@@ -536,12 +542,8 @@ impl Channel {
                     }
                 };
 
-                if *seen {
-                    println!("seen");
-                    break 'b vec![];
-                }
+                if *seen {break 'b vec![];}
 
-                println!("returned");
                 *seen = true;
 
                 while let Some(false) = received.front() {
@@ -554,30 +556,31 @@ impl Channel {
         })
     }
 
-    fn update(&mut self, ping: u128, socket: &mut Socket) -> Result<(), Error> {
+    fn update(&mut self, ping: Option<u128>, socket: &mut Socket) -> Result<(), Error> {
         match &mut self.channel_type {
             ChannelType::SendUnreliable => (),
             ChannelType::ReceiveUnreliable => (),
 
             ChannelType::SendReliable { messages, messages_start_seq, resend_threshhold, .. } => {
-                let mut seq = *messages_start_seq;
-                for message in messages.iter_mut() {
-                    if let Some((last_sent, message)) = message {
+                // only resend if ping has been calculated
+                if let Some(ping) = ping {
 
+                    let mut seq = *messages_start_seq;
+                    for message in messages.iter_mut() {
+                        if let Some((last_sent, message)) = message {
 
-                        if last_sent.elapsed().as_millis() as f32 > ping as f32 * *resend_threshhold {
-                            socket.channel_prefix(self.channel_id)?;
-                            socket.write(&seq.to_be_bytes())?;
-                            socket.write(&*message)?;
-                            socket.send(self.addr)?;
+                            if last_sent.elapsed().as_millis() as f32 > ping as f32 * *resend_threshhold {
+                                socket.channel_prefix(self.channel_id)?;
+                                socket.write(&seq.to_be_bytes())?;
+                                socket.write(&*message)?;
+                                socket.send(self.addr)?;
 
-                            *last_sent = Instant::now();
-
-                            println!("resent seq {}", seq);
+                                *last_sent = Instant::now();
+                            }
                         }
-                    }
 
-                    seq += 1;
+                        seq += 1;
+                    }
                 }
             },
 
@@ -586,8 +589,6 @@ impl Channel {
                     socket.channel_prefix(self.channel_id)?;
                     socket.write(&seq.to_be_bytes())?;
                     socket.send(self.addr)?;
-
-                    println!("sent ack {}", seq);
                 }
             }
         }

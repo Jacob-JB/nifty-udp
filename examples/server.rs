@@ -29,7 +29,11 @@ fn main() {
             match event {
                 Event::Connection(addr) => println!("connection {}", addr),
                 Event::Disconnection(addr, reason) => println!("disconnected {} {:?}", addr, reason),
-                Event::Message(addr, channel_id, message) => println!("message from {} on channel {} {:?}", addr, channel_id, std::str::from_utf8(&message).unwrap()),
+                Event::Message(addr, channel_id, message) => {
+                    println!("message from {} on channel {} {:?}", addr, channel_id, std::str::from_utf8(&message).unwrap());
+
+                    server.send(addr, 3, "Pong".as_bytes()).unwrap();
+                },
             }
         }
     }

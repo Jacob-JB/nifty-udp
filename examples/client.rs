@@ -35,13 +35,20 @@ fn main() {
             match event {
                 Event::Connection(addr) => println!("connection {}", addr),
                 Event::Disconnection(addr, reason) => println!("disconnected {} {:?}", addr, reason),
-                Event::Message(addr, channel_id, message) => println!("message from {} on channel {} {:?}", addr, channel_id, message),
+                Event::Message(addr, channel_id, message) => {
+                    println!("message from {} on channel {} {:?}", addr, channel_id, message);
+
+                    client.disconnect_all();
+                },
             }
         }
 
         if last_ping.elapsed().as_millis() > 3000 {
             client.send_single(2, "Ping".as_bytes()).unwrap();
             last_ping = Instant::now();
+            for i in client.connections() {
+                println!("current ping for {} is {:?}", i, client.get_ping(i).unwrap());
+            }
         }
     }
 }
