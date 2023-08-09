@@ -3,5 +3,5 @@
 version = 3
 
 [[package]]
-name = "udp-4"
+name = "nifty_udp"
 version = "0.1.0"

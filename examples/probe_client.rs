@@ -1,5 +1,5 @@
 
-use udp_4::*;
+use nifty_udp::*;
 
 fn main() {
     let mut client = Client::bind_any(ClientConfig {
