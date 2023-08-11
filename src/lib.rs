@@ -88,8 +88,19 @@ impl Socket {
         Ok(self.socket.send_to(&self.out_buffer, addr)?)
     }
 
-    fn receive(&mut self) -> Option<(&[u8], SocketAddr)> {
-        self.socket.recv_from(&mut self.in_buffer).ok().and_then(|(received_bytes, origin)| Some((&self.in_buffer[..received_bytes], origin)))
+    fn receive(&mut self) -> Result<Option<(&[u8], SocketAddr)>, Error> {
+        match self.socket.recv_from(&mut self.in_buffer) {
+            Err(err) => {
+                if let std::io::ErrorKind::WouldBlock = err.kind() {
+                    Ok(None)
+                } else {
+                    Err(err.into())
+                }
+            },
+            Ok((received_bytes, origin)) => {
+                Ok(Some((&self.in_buffer[..received_bytes], origin)))
+            }
+        }
     }
 
     fn heartbeat(&mut self, addr: SocketAddr, instance: &[u8; 16], time: u128) -> Result<(), Error> {
@@ -184,7 +195,7 @@ impl Client {
     pub fn update(&mut self) -> Result<Vec<Event>, Error> {
 
         // receive messages
-        while let Some((message, origin)) = self.socket.receive() {
+        while let Some((message, origin)) = self.socket.receive()? {
 
             let mut channel_message = None;
             let mut heartbeat_data: Option<([u8; 16], [u8; 16])> = None;
