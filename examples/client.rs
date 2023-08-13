@@ -26,7 +26,7 @@ fn main() {
         }
     ).unwrap();
 
-    client.connect("10.0.20.207:3000".parse().unwrap()).unwrap();
+    client.connect("10.0.20.248:3000".parse().unwrap()).unwrap();
 
     let mut last_ping = Instant::now();
 

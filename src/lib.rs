@@ -89,16 +89,18 @@ impl Socket {
     }
 
     fn receive(&mut self) -> Result<Option<(&[u8], SocketAddr)>, Error> {
-        match self.socket.recv_from(&mut self.in_buffer) {
-            Err(err) => {
-                if let std::io::ErrorKind::WouldBlock = err.kind() {
-                    Ok(None)
-                } else {
-                    Err(err.into())
+        loop {
+            match self.socket.recv_from(&mut self.in_buffer) {
+                Err(err) => {
+                    match err.kind() {
+                        std::io::ErrorKind::WouldBlock => break Ok(None),
+                        std::io::ErrorKind::ConnectionReset => continue,
+                        _ => break Err(err.into()),
+                    }
+                },
+                Ok((received_bytes, origin)) => {
+                    break Ok(Some((&self.in_buffer[..received_bytes], origin)))
                 }
-            },
-            Ok((received_bytes, origin)) => {
-                Ok(Some((&self.in_buffer[..received_bytes], origin)))
             }
         }
     }
