@@ -659,7 +659,7 @@ impl Channel {
                 vec![Vec::from(&message[8..])]
             },
 
-            ChannelType::SendFecReliable { messages_start_seq, messages, max_data_symbols, max_repair_symbols, seq_counter, .. } => {
+            ChannelType::SendFecReliable { messages_start_seq, messages, .. } => {
                 match message.get(0) {
                     // whole message received acknowledgement
                     Some(0) => 'b: {
