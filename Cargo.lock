@@ -3,5 +3,30 @@
 version = 3
 
 [[package]]
+name = "log"
+version = "0.4.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5e6163cb8c49088c2c36f57875e58ccd8c87c7427f7fbd50ea6710b2f3f2e8f"
+
+[[package]]
 name = "nifty_udp"
 version = "0.1.0"
+dependencies = [
+ "raptor-code",
+]
+
+[[package]]
+name = "primes"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68a61082d8bceecd71a3870e9162002bb75f7ba9c7aa8b76227e887782fef9c8"
+
+[[package]]
+name = "raptor-code"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "afc640ee77395e29969017be35de4f902987018ccfaa5fe5be0ae654dbdfc71c"
+dependencies = [
+ "log",
+ "primes",
+]

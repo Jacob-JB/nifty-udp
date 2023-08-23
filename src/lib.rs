@@ -1,4 +1,4 @@
-use std::{net::{UdpSocket, SocketAddr}, time::{Instant, UNIX_EPOCH, SystemTime}, collections::{HashMap, hash_map::Entry, VecDeque}};
+use std::{net::{UdpSocket, SocketAddr}, time::{Instant, UNIX_EPOCH, SystemTime}, collections::{HashMap, hash_map::Entry, VecDeque}, io::Write};
 
 
 /// describes the static behavior of a client
@@ -32,11 +32,19 @@ pub struct ClientConfig {
 pub enum ChannelConfig {
     SendUnreliable,
     ReceiveUnreliable,
+
     SendReliable {
         /// at what multiple after the connections average ping time should a message be resent
         resend_threshhold: f32,
     },
     ReceiveReliable,
+
+    SendFecReliable {
+        resend_threshhold: f32,
+        max_data_symbols: usize,
+        max_repair_symbols: usize,
+    },
+    ReceiveFecReliable,
 }
 
 
@@ -447,7 +455,31 @@ enum ChannelType {
 
         received_start_seq: u64,
         received: VecDeque<bool>,
-    }
+    },
+
+    SendFecReliable {
+        resend_threshhold: f32,
+
+        max_data_symbols: usize,
+        max_repair_symbols: usize,
+
+        seq_counter: u64,
+
+        messages_start_seq: u64,
+        messages: VecDeque<Option<(Instant, Vec<Option<Vec<u8>>>)>>,
+    },
+    ReceiveFecReliable {
+        messages_start_seq: u64,
+        messages: VecDeque<ReceiveFecMessage>,
+    },
+}
+
+enum ReceiveFecMessage {
+    NotSeen,
+    Receiving {
+        decoder: raptor_code::SourceBlockDecoder,
+    },
+    Received,
 }
 
 impl Channel {
@@ -459,6 +491,7 @@ impl Channel {
             channel_type: match config {
                 ChannelConfig::SendUnreliable => ChannelType::SendUnreliable,
                 ChannelConfig::ReceiveUnreliable => ChannelType::ReceiveUnreliable,
+
                 ChannelConfig::SendReliable { resend_threshhold } => ChannelType::SendReliable {
                     resend_threshhold: *resend_threshhold,
 
@@ -472,7 +505,23 @@ impl Channel {
 
                     received_start_seq: 0,
                     received: VecDeque::new(),
-                }
+                },
+
+                ChannelConfig::SendFecReliable { resend_threshhold, max_data_symbols, max_repair_symbols } => ChannelType::SendFecReliable {
+                    resend_threshhold: *resend_threshhold,
+
+                    max_data_symbols: *max_data_symbols,
+                    max_repair_symbols: *max_repair_symbols,
+
+                    seq_counter: 0,
+
+                    messages_start_seq: 0,
+                    messages: VecDeque::new(),
+                },
+                ChannelConfig::ReceiveFecReliable => ChannelType::ReceiveFecReliable {
+                    messages_start_seq: 0,
+                    messages: VecDeque::new(),
+                },
             }
         }
     }
@@ -483,6 +532,7 @@ impl Channel {
         match &mut self.channel_type {
             ChannelType::ReceiveUnreliable => return Err(Error::SendOnReceiveChannel),
             ChannelType::ReceiveReliable { .. } => return Err(Error::SendOnReceiveChannel),
+            ChannelType::ReceiveFecReliable { .. } => return Err(Error::SendOnReceiveChannel),
 
 
             ChannelType::SendUnreliable => {
@@ -499,6 +549,51 @@ impl Channel {
                 messages.push_back(Some((Instant::now(), Vec::from(message))));
                 *seq_counter += 1;
 
+            },
+
+
+            ChannelType::SendFecReliable { max_data_symbols, max_repair_symbols, seq_counter, messages, .. } => {
+
+                let (encoded_symbols, num_source_symbols) = raptor_code::encode_source_block(
+                    message,
+                    *max_data_symbols,
+                    *max_repair_symbols,
+                );
+
+                // println!("new fec message {} with {} symbols {:?}", seq_counter, num_source_symbols as usize + *max_repair_symbols, encoded_symbols);
+
+                let sequence = seq_counter.to_be_bytes();
+                let num_source_symbols = num_source_symbols.to_be_bytes();
+
+
+                let mut packets = Vec::new();
+
+                for (encoded_symbol_index, encoded_symbol) in encoded_symbols.iter().enumerate() {
+                    let mut packet = Vec::new();
+
+                    // 8 bytes
+                    packet.write(&sequence)?;
+                    // 4 bytes
+                    packet.write(&num_source_symbols)?;
+                    // 1 byte
+                    packet.write(&[encoded_symbol_index as u8])?;
+                    // 2 bytes
+                    packet.write(&(message.len() as u16).to_be_bytes())?;
+
+                    packet.write(&encoded_symbol)?;
+
+                    socket.channel_prefix(self.channel_id)?;
+                    socket.write(&packet)?;
+                    socket.send(self.addr)?;
+
+                    packets.push(Some(packet));
+                }
+
+                messages.push_back(Some((
+                    Instant::now(),
+                    packets,
+                )));
+                *seq_counter += 1;
             },
         }
 
@@ -562,6 +657,167 @@ impl Channel {
                 }
 
                 vec![Vec::from(&message[8..])]
+            },
+
+            ChannelType::SendFecReliable { messages_start_seq, messages, max_data_symbols, max_repair_symbols, seq_counter, .. } => {
+                match message.get(0) {
+                    // whole message received acknowledgement
+                    Some(0) => 'b: {
+                        let Some(seq_id) = message.get(1..9) else {break 'b;};
+                        let seq_id = u64::from_be_bytes(seq_id.try_into().unwrap());
+
+                        // println!("got ack for full fec message {}", seq_id);
+
+                        if seq_id < *messages_start_seq {break 'b;}
+
+                        if let Some(message) = messages.get_mut((seq_id - *messages_start_seq) as usize) {
+                            // mark message as received
+                            *message = None;
+
+                            // clear front of message ring buffer
+                            while let Some(Some(_)) = messages.front() {
+                                messages.pop_front();
+                                *messages_start_seq += 1;
+                            }
+                        }
+                    },
+                    Some(1) => 'b: {
+                        // single symbol/packet received acknowledgement
+                        let (
+                            Some(seq_id),
+                            Some(symbol_index),
+                         ) = (
+                            message.get(1..9),
+                            message.get(9)
+                        ) else {break 'b;};
+                        let seq_id = u64::from_be_bytes(seq_id.try_into().unwrap());
+
+                        // println!("got ack for fec symbol {} {}", seq_id, symbol_index);
+
+                        if seq_id < *messages_start_seq {break 'b;}
+
+                        if let Some(message) = messages.get_mut((seq_id - *messages_start_seq) as usize) {
+                            if let Some((_, symbols)) = message {
+                                if let Some(symbol) = symbols.get_mut(*symbol_index as usize) {
+                                    // mark packet/symbol as received
+                                    *symbol = None;
+
+                                    // mark as sent if every packet gets acknowledged
+                                    if !symbols.iter().any(|e| e.is_some()) {
+                                        *message = None;
+
+                                        // clear front of message ring buffer
+                                        while let Some(Some(_)) = messages.front() {
+                                            messages.pop_front();
+                                            *messages_start_seq += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    _ => (),
+                }
+
+                vec![]
+            },
+
+            ChannelType::ReceiveFecReliable { messages, messages_start_seq, .. } => 'b: {
+
+                // get header values
+                let (
+                    Some(seq_id),
+                    Some(num_source_symbols),
+                    Some(symbol_index),
+                    Some(message_length),
+                ) = (
+                    message.get(0..8),
+                    message.get(8..12),
+                    message.get(12..13),
+                    message.get(13..15),
+                ) else {break 'b vec![];};
+
+                let seq_id = u64::from_be_bytes(seq_id.try_into().unwrap());
+                let num_source_symbols = u32::from_be_bytes(num_source_symbols.try_into().unwrap());
+                let symbol_index = u8::from_be_bytes(symbol_index.try_into().unwrap());
+                let source_block_length = u16::from_be_bytes(message_length.try_into().unwrap());
+
+                // println!("got fec symbol for sequence {} index {}", seq_id, symbol_index);
+
+                // get the entry for the given seq_id in the receiving messages ring buffer
+                if seq_id < *messages_start_seq {
+                    // send ack for full message received
+                    socket.channel_prefix(self.channel_id)?;
+                    socket.write(&[0])?;
+                    socket.write(&seq_id.to_be_bytes())?;
+                    socket.send(self.addr)?;
+
+                    break 'b vec![];
+                } else {
+                    // send ack for single symbol received
+                    socket.channel_prefix(self.channel_id)?;
+                    socket.write(&[1])?;
+                    socket.write(&seq_id.to_be_bytes())?;
+                    socket.write(&[symbol_index])?;
+                    socket.send(self.addr)?;
+                }
+
+                let index = (seq_id - *messages_start_seq) as usize;
+
+                let receiving_message = loop {
+                    match messages.get_mut(index) {
+                        None => messages.push_back(ReceiveFecMessage::NotSeen),
+                        Some(message) => break message,
+                    }
+                };
+
+                // if not seen yet initialize the decoder
+                if let ReceiveFecMessage::NotSeen = receiving_message {
+                    *receiving_message = ReceiveFecMessage::Receiving {
+                        decoder: raptor_code::SourceBlockDecoder::new(num_source_symbols as usize,),
+                    };
+                }
+
+                // get the decoder
+                let decoder = match receiving_message {
+                    ReceiveFecMessage::NotSeen => unreachable!(),
+                    ReceiveFecMessage::Received => {
+                        // send ack for full message received
+                        socket.channel_prefix(self.channel_id)?;
+                        socket.write(&[0])?;
+                        socket.write(&seq_id.to_be_bytes())?;
+                        socket.send(self.addr)?;
+
+                        break 'b vec![];
+                    },
+                    ReceiveFecMessage::Receiving { decoder } => decoder,
+                };
+
+                // push the symbol to the decoder
+                decoder.push_encoding_symbol(&message[15..], symbol_index as u32);
+
+                // check if decoding is possible
+                if decoder.fully_specified() {
+                    let message = decoder.decode(source_block_length as usize).unwrap();
+
+                    *receiving_message = ReceiveFecMessage::Received;
+
+                    // send ack for full message received
+                    socket.channel_prefix(self.channel_id)?;
+                    socket.write(&[0])?;
+                    socket.write(&seq_id.to_be_bytes())?;
+                    socket.send(self.addr)?;
+
+                    // clear the front of the receiving ring buffer
+                    while let Some(ReceiveFecMessage::Received) = messages.front() {
+                        messages.pop_front();
+                        *messages_start_seq += 1;
+                    }
+
+                    vec![message]
+                } else {
+                    vec![]
+                }
             }
         })
     }
@@ -600,7 +856,36 @@ impl Channel {
                     socket.write(&seq.to_be_bytes())?;
                     socket.send(self.addr)?;
                 }
-            }
+            },
+
+            ChannelType::SendFecReliable { messages, resend_threshhold, .. } => {
+                // retransmit packets that have not gotten acks
+
+                // only resend if ping has been calculated
+                if let Some(ping) = ping {
+
+                    for message in messages.iter_mut() {
+                        if let Some((last_sent, symbols)) = message {
+
+                            if last_sent.elapsed().as_millis() as f32 > ping as f32 * *resend_threshhold {
+                                for symbol in symbols.iter() {
+                                    if let Some(packet) = symbol {
+                                        // println!("retransmitting an fec symbol");
+                                        socket.channel_prefix(self.channel_id)?;
+                                        socket.write(&packet)?;
+                                        socket.send(self.addr)?;
+                                    }
+                                }
+
+                                *last_sent = Instant::now();
+                            }
+                        }
+                    }
+                }
+
+            },
+
+            ChannelType::ReceiveFecReliable { .. } => (),
         }
 
         Ok(())
