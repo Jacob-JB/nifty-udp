@@ -675,7 +675,7 @@ impl Channel {
                             *message = None;
 
                             // clear front of message ring buffer
-                            while let Some(Some(_)) = messages.front() {
+                            while let Some(None) = messages.front() {
                                 messages.pop_front();
                                 *messages_start_seq += 1;
                             }
@@ -858,7 +858,7 @@ impl Channel {
                 }
             },
 
-            ChannelType::SendFecReliable { messages, resend_threshhold, .. } => {
+            ChannelType::SendFecReliable { messages, resend_threshhold, messages_start_seq, .. } => {
                 // retransmit packets that have not gotten acks
 
                 // only resend if ping has been calculated
@@ -882,6 +882,23 @@ impl Channel {
                         }
                     }
                 }
+
+                // let mut n = *messages_start_seq;
+                // for message in messages.iter() {
+                //     if n != *messages_start_seq {
+                //         print!(", ")
+                //     }
+
+                //     if message.is_some() {
+                //         print!("{}", n);
+                //     } else {
+                //         print!("{}", "_".repeat(n.to_string().len()));
+                //     }
+
+                //     n += 1;
+                // }
+
+                // println!();
 
             },
 
