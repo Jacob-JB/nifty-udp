@@ -63,7 +63,6 @@ pub(crate) struct Socket {
 impl Socket {
     fn new(max_message_size: u16, bind_addr: SocketAddr) -> Result<Self, Error> {
         let socket = UdpSocket::bind(bind_addr)?;
-        socket.set_nonblocking(true)?;
 
         let max_message_size = max_message_size as usize;
 
@@ -98,7 +97,12 @@ impl Socket {
 
     fn receive(&mut self) -> Result<Option<(&[u8], SocketAddr)>, Error> {
         loop {
-            match self.socket.recv_from(&mut self.in_buffer) {
+            match {
+                self.socket.set_nonblocking(true)?;
+                let result = self.socket.recv_from(&mut self.in_buffer);
+                self.socket.set_nonblocking(false)?;
+                result
+             } {
                 Err(err) => {
                     match err.kind() {
                         std::io::ErrorKind::WouldBlock => break Ok(None),
